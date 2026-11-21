@@ -66,6 +66,16 @@ The list of official publishers is cached for a day in `~/.cache/skill-info/`.
 
 Nothing downloaded is ever executed. The temporary clone is deleted after the run.
 
+## Security notes
+
+By design, this skill reads text written by third parties (the skill being inspected, GitHub profiles, skills.sh pages). Snyk flags this as W011, "third-party content exposure", the same finding it reports for other discovery skills such as `find-skills`. The exposure can't be removed without removing the feature, so skill-info limits it instead:
+
+- Third-party strings are sanitised before the agent sees them. Hidden, bidi and control characters are stripped. Newlines are collapsed, so the text can't fake headings or code fences. Backticks are neutralised and the text is truncated.
+- In the report, third-party strings are wrapped in `⟦…⟧`, under a notice that they are data, not instructions.
+- Commit messages are never shown to the agent, only aggregate language statistics.
+- The install command is built by the script itself, not scraped from the page.
+- SKILL.md tells the agent not to fetch, open or run anything from the inspected skill. It also tells the agent to report any embedded instructions as a prompt-injection red flag.
+
 ## Privacy
 
 The tool uses only public data. It prints email domains, never full addresses. Country inference never uses names or ethnicity.
