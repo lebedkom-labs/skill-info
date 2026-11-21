@@ -72,6 +72,19 @@ def http_get(url: str, headers: dict | None = None, timeout: int = TIMEOUT, raw:
         return 0, (b"" if raw else str(e)), {}
 
 
+def http_head_bytes(url: str, nbytes: int, timeout: int = 6):
+    """GET but read only the first `nbytes`, then drop the connection (for servers that ignore Range)."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "identity",
+                                               "Range": f"bytes=0-{nbytes - 1}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read(nbytes).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except Exception:
+        return 0, ""
+
+
 def get_json(url: str, headers: dict | None = None):
     status, body, hdrs = http_get(url, headers)
     if status != 200:
@@ -232,13 +245,19 @@ def resolve(query: str, prefer_skill: str | None = None):
 # --------------------------------------------------------------------------- skills.sh page + audits
 
 
-def page_text(url: str):
+def page_html(url: str):
     status, body, _ = http_get(url)
-    if status != 200:
-        return None
+    return body if status == 200 else None
+
+
+def html_lines(body: str):
     t = re.sub(r"<script.*?</script>|<style.*?</style>", "", body, flags=re.S)
     t = re.sub(r"<[^>]+>", "\n", t)
     return [html.unescape(x).strip() for x in t.split("\n") if x.strip()]
+
+
+def strip_tags(fragment: str):
+    return html.unescape(re.sub(r"<[^>]+>", "", fragment))
 
 
 def after(lines, label, n=1):
@@ -250,9 +269,10 @@ def after(lines, label, n=1):
 
 
 def scrape_skill_page(skill_id: str, slug: str):
-    lines = page_text(f"{SKILLS}/{skill_id}")
-    if not lines:
+    body = page_html(f"{SKILLS}/{skill_id}")
+    if not body:
         return {}
+    lines = html_lines(body)
     out = {
         "installs_text": after(lines, "Installs"),
         "github_stars_text": after(lines, "GitHub Stars"),
@@ -266,13 +286,17 @@ def scrape_skill_page(skill_id: str, slug: str):
             out["category"] = untrusted(lines[i - 1], 60)
     except ValueError:
         pass
-    # summary block
-    try:
-        i, j = lines.index("Summary"), lines.index("SKILL.md")
-        if i < j:
-            out["summary"] = untrusted(" ".join(lines[i + 1 : j]), 1200)
-    except ValueError:
-        pass
+    # AI summary block (not every skill has one): <p> headline + <li> points, up to the SKILL.md pane
+    i = body.find(">Summary<")
+    j = body.find(">SKILL.md<", i)
+    if i != -1 and j != -1:
+        seg = body[i:j]
+        head = re.search(r"<p[^>]*>(.*?)</p>", seg, re.S)
+        if head:
+            out["summary"] = untrusted(strip_tags(head.group(1)), 300)
+        pts = [untrusted(strip_tags(li), 250) for li in re.findall(r"<li[^>]*>(.*?)</li>", seg, re.S)]
+        if pts:
+            out["summary_points"] = pts[:8]
     return out
 
 
@@ -384,7 +408,7 @@ def git_log(repo, path=None, max_commits=2000):
             "committer_email": ce.lower(), "subject": subj, "body": body,
             "bot": bool(BOT_RE.search(an) or BOT_RE.search(ae)),
             "web": ce.lower() == "noreply@github.com",
-            "tz_known": True,
+            "tz_known": ce.lower() != "noreply@github.com",  # web-UI commits are stamped +0000
         })
     return commits
 
@@ -497,7 +521,14 @@ def fmt_off(m: int):
 
 
 def tz_analysis(commits):
-    usable = [c for c in commits if not c["bot"] and not c["web"] and c.get("tz_known")]
+    usable = [c for c in commits if not c["bot"] and c.get("tz_known")]
+    humans = [c for c in commits if not c["bot"]]
+    if not usable:
+        web = sum(1 for c in humans if c["web"])
+        reason = (f"all {web} human commits were made in the GitHub web UI (squash merges are stamped +0000) "
+                  "and no original PR commits could be read") if humans and web == len(humans) \
+            else "no commits with a usable local UTC offset"
+        return {"commits_analyzed": 0, "unknown_reason": reason, "offsets": []}
     offs = collections.Counter(int(c["date"].utcoffset().total_seconds() // 60) for c in usable)
     winter = collections.Counter(int(c["date"].utcoffset().total_seconds() // 60)
                                  for c in usable if c["date"].month in (11, 12, 1, 2, 3))
@@ -507,6 +538,7 @@ def tz_analysis(commits):
     weekdays = collections.Counter(c["date"].weekday() for c in usable)
     res = {
         "commits_analyzed": len(usable),
+        "from_pr_patches": sum(1 for c in usable if c.get("tz_source") == "pr"),
         "excluded_bot_or_web": len(commits) - len(usable),
         "offsets": [{"offset": fmt_off(k), "count": v, "regions": TZ_REGIONS.get(k, "?")} for k, v in offs.most_common(6)],
     }
@@ -563,7 +595,7 @@ RISK_PATTERNS = [
      r"|do not (tell|inform|notify) the user|without (asking|telling|informing) the user|hide (this|it) from the user"),
     ("destructive-rm", "high", r"rm\s+-[a-z]*r[a-z]*f?[a-z]*\s+(/|~|\$HOME)(\s|$|/\*)"),
     ("base64-decode", "medium", r"base64\s+(-d|--decode)|b64decode\(|atob\(|FromBase64String"),
-    ("dynamic-eval", "medium", r"\beval\s*\(|\bexec\s*\(|new Function\("),
+    ("dynamic-eval", "medium", r"(?<![.\w$])(eval|exec)\(|new Function\("),  # not regex.exec() / model.eval()
     ("credential-paths", "medium",
      r"~/\.ssh|id_rsa|id_ed25519|\.aws/credentials|\.netrc|\.npmrc|\.pypirc|\.docker/config\.json|keychain|"
      r"\.git-credentials|\.kube/config"),
@@ -599,6 +631,11 @@ def q(v, limit=300):
     return f"⟦{untrusted(v, limit)}⟧" if v not in (None, "") else "—"
 
 
+MEDIA_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif", ".mp3", ".wav", ".ogg",
+             ".flac", ".m4a", ".aac", ".mp4", ".mov", ".webm", ".mkv", ".avi", ".ttf", ".otf", ".woff", ".woff2",
+             ".eot", ".pdf")
+ARCHIVE_EXT = (".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar")
+EXEC_MAGIC = (b"\x7fELF", b"MZ", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\x00asm")
 BINARY_EXT = (".exe", ".dll", ".so", ".dylib", ".bin", ".jar", ".pyc", ".wasm", ".node", ".class")
 URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+)")
 
@@ -613,9 +650,13 @@ def clone_skill_files(repo, skill_dir):
             continue
         path, size = m.group(3), int(m.group(2)) if m.group(2) != "-" else 0
         data = None
-        if len(out) < MAX_SCAN_FILES and size <= MAX_SCAN_BYTES and not path.lower().endswith(BINARY_EXT):
+        is_media = path.lower().endswith(MEDIA_EXT)
+        if len(out) < MAX_SCAN_FILES and (size <= MAX_SCAN_BYTES or is_media) \
+                and not path.lower().endswith(BINARY_EXT + ARCHIVE_EXT):
             data = subprocess.run(["git", "--git-dir", repo, "cat-file", "-p", f"HEAD:{path}"],
                                   capture_output=True, timeout=60).stdout
+            if is_media:
+                data = data[:16]
         out.append((path, size, data))
     return out
 
@@ -626,28 +667,50 @@ MAX_SCAN_FILES, MAX_SCAN_BYTES = 120, 512_000
 def scan_files(files, skill_md_path=None):
     """Static scan of [(path, size, bytes|None)]; None content = not fetched (binary/too big/limit)."""
     findings, domains, total = [], collections.Counter(), 0
-    skill_md_text, frontmatter = None, {}
+    skill_md_text, frontmatter, frontmatter_headings = None, {}, []
     exts = collections.Counter()
+    media = 0
     for path, size, raw in files:
         total += size
-        exts[os.path.splitext(path)[1].lower() or "(none)"] += 1
-        if path.lower().endswith(BINARY_EXT):
-            findings.append({"rule": "binary-file", "severity": "medium", "file": path, "line": 0, "snippet": ""})
+        low = path.lower()
+        exts[os.path.splitext(low)[1] or "(none)"] += 1
+        if low.endswith(BINARY_EXT):
+            findings.append({"rule": "executable-binary", "severity": "medium", "file": path, "line": 0, "snippet": ""})
+            continue
+        if low.endswith(ARCHIVE_EXT):
+            findings.append({"rule": "archive-file", "severity": "medium", "file": path, "line": 0, "snippet": ""})
+            continue
+        if low.endswith(MEDIA_EXT):  # assets are fine; only the first bytes are checked for a disguised executable
+            media += 1
+            if raw and raw[:4].startswith(EXEC_MAGIC) and not low.endswith(".svg"):
+                findings.append({"rule": "disguised-executable", "severity": "high", "file": path, "line": 0,
+                                 "snippet": "media extension but executable header"})
             continue
         if raw is None:
             continue
+        if raw[:4].startswith(EXEC_MAGIC[:2]) or raw[:4] in EXEC_MAGIC[2:]:
+            findings.append({"rule": "executable-binary", "severity": "medium", "file": path, "line": 0, "snippet": ""})
+            continue
         if b"\x00" in raw[:8000]:
-            findings.append({"rule": "binary-file", "severity": "medium", "file": path, "line": 0, "snippet": ""})
+            findings.append({"rule": "binary-file", "severity": "low", "file": path, "line": 0, "snippet": ""})
             continue
         text = raw.decode("utf-8", "replace")
         if path == skill_md_path:
             skill_md_text = text
-            fm = re.match(r"^---\n(.*?)\n---", text, re.S)
+            fm = re.match(r"^---\r?\n(.*?)\r?\n---", text, re.S)
             if fm:
+                key = None
                 for l in fm.group(1).splitlines():
-                    if ":" in l and not l.startswith(" "):
-                        k, v = l.split(":", 1)
-                        frontmatter[untrusted(k, 40)] = untrusted(v, 300)
+                    if ":" in l and not l[:1].isspace():
+                        key, v = l.split(":", 1)
+                        key = untrusted(key, 40)
+                        frontmatter[key] = v.strip()
+                    elif key and l[:1].isspace():  # folded / multi-line YAML value
+                        frontmatter[key] = (frontmatter[key] + " " + l.strip()).strip()
+                frontmatter = {k: untrusted(v.lstrip(">|-").strip().strip("'\""), 600) for k, v in frontmatter.items()}
+            body_md = text[fm.end():] if fm else text
+            headings = [untrusted(h, 80) for h in re.findall(r"^#{1,2}\s+(.+)$", body_md, re.M)]
+            frontmatter_headings = headings[:12]
         for d in URL_RE.findall(text):
             domains[d.lower()] += 1
         body = text.lstrip("\ufeff")
@@ -659,12 +722,20 @@ def scan_files(files, skill_md_path=None):
         for rule, sev, pat in RISK_PATTERNS:
             for m in re.finditer(pat, body, re.I):
                 ln = body.count("\n", 0, m.start()) + 1
-                line = body.splitlines()[ln - 1] if body.splitlines() else ""
-                findings.append({"rule": rule, "severity": sev, "file": path, "line": ln, "snippet": untrusted(line, 160)})
+                all_lines = body.splitlines()
+                line = all_lines[ln - 1] if all_lines else ""
+                f = {"rule": rule, "severity": sev, "file": path, "line": ln, "snippet": untrusted(line, 160)}
+                if sev != "low":  # ±2 lines so the agent can judge without opening the file
+                    f["context"] = [{"line": n + 1, "text": untrusted(all_lines[n], 160)}
+                                    for n in range(max(0, ln - 3), min(len(all_lines), ln + 2)) if n != ln - 1]
+                findings.append(f)
                 break  # one hit per rule per file is enough
+    sev_rank = {"high": 0, "medium": 1, "low": 2}
+    findings.sort(key=lambda f: sev_rank.get(f["severity"], 3))
     return {
         "files": len(files), "total_bytes": total, "extensions": dict(exts.most_common(10)),
-        "frontmatter": frontmatter, "findings": findings,
+        "frontmatter": frontmatter, "skill_md_headings": frontmatter_headings, "media_assets": media,
+        "findings": findings,
         "external_domains": [d for d, _ in domains.most_common(25)],
         "skill_md_text": skill_md_text,
     }
@@ -747,7 +818,7 @@ def finish_score(parts, flags, r):
 
     scan = r.get("scan") or {}
     sev = collections.Counter(f["severity"] for f in scan.get("findings", []))
-    pen = 10 * sev["high"] + 3 * sev["medium"] + 1 * sev["low"]
+    pen = 10 * sev["high"] + min(12, 3 * sev["medium"]) + min(4, sev["low"])  # many lows ≠ one high
     s = max(0, 19 - pen) if scan else 5
     parts.append(("static scan", s, 19, f"high={sev['high']} med={sev['medium']} low={sev['low']}" if scan else "not run"))
     if sev["high"]:
@@ -831,30 +902,48 @@ def api_commit(c):
             "web": (cmt.get("email") or "").lower() == "noreply@github.com", "tz_known": False}
 
 
-def patch_date(source, sha):
-    """Local author date (with UTC offset) from the mbox header of <sha>.patch (first 1.5 KB only)."""
+PR_RE = re.compile(r"\(#(\d+)\)\s*$")
+
+
+def patch_date(source, commit):
+    """Local author date (with UTC offset) from an mbox patch header.
+    Normal commits: <sha>.patch. Web-UI squash merges are stamped +0000, so for those the original first
+    commit of the PR is read from pull/<n>.patch instead. Only the first few KB are downloaded."""
+    pr = PR_RE.search(commit["subject"]) if commit["web"] else None
+    if commit["web"] and not pr:
+        return None
+    url = (f"https://github.com/{source}/pull/{pr.group(1)}.patch" if pr
+           else f"https://github.com/{source}/commit/{commit['sha']}.patch")
     for attempt in range(2):  # 429/503: burst throttling, or a huge diff GitHub won't render in time
-        status, body, _ = http_get(f"https://github.com/{source}/commit/{sha}.patch",
-                                   {"Range": "bytes=0-1535"}, timeout=5)
+        status, body = http_head_bytes(url, 4096 if pr else 1536, timeout=5)
         if status not in (429, 503):
             break
         time.sleep(0.3)
     if status not in (200, 206):
         return None
+    if pr:  # the PR's first commit must be by the same person as the squash commit
+        frm = re.search(r"^From: .*<([^>]+)>", body, re.M)
+        if not frm or frm.group(1).lower() != commit["email"]:
+            return None
     m = re.search(r"^Date: (.+)$", body, re.M)
     try:
-        return email.utils.parsedate_to_datetime(m.group(1).strip()) if m else None
+        d = email.utils.parsedate_to_datetime(m.group(1).strip()) if m else None
     except (TypeError, ValueError):
         return None
+    if d is not None and pr and d.utcoffset() == dt.timedelta(0):
+        return None  # still UTC: no information
+    return d
 
 
 def enrich_offsets(source, commits):
-    todo = [c for c in commits if not c["tz_known"] and not c["bot"] and not c["web"]][:PATCH_SAMPLE]
-    dates = pmap_deadline(lambda c: patch_date(source, c["sha"]), todo, 8, PATCH_DEADLINE)
+    todo = [c for c in commits if not c["tz_known"] and not c["bot"]
+            and (not c["web"] or PR_RE.search(c["subject"]))][:PATCH_SAMPLE]
+    dates = pmap_deadline(lambda c: patch_date(source, c), todo, 8, PATCH_DEADLINE)
     ok = 0
     for c, d in zip(todo, dates):
         if d is not None and d.utcoffset() is not None:
             c["date"], c["tz_known"] = d, True
+            c["tz_source"] = "pr" if c["web"] else "commit"
             ok += 1
     return ok
 
@@ -874,10 +963,12 @@ def collect_github_fast(r, source, slug, owner_login, prefetched):
     if not entries:
         entries = [{"path": smd, "size": 0}]
     fetchable = [e for e in entries[:MAX_SCAN_FILES]
-                 if (e.get("size") or 0) <= MAX_SCAN_BYTES and not e["path"].lower().endswith(BINARY_EXT)]
+                 if not e["path"].lower().endswith(BINARY_EXT + ARCHIVE_EXT)
+                 and ((e.get("size") or 0) <= MAX_SCAN_BYTES or e["path"].lower().endswith(MEDIA_EXT))]
     jobs = {"files": None, "readme": None, "skill_commits": None}
     with cf.ThreadPoolExecutor(max_workers=3) as ex:
-        f_files = ex.submit(pmap, lambda e: raw_file(source, e["path"]), fetchable, 16)
+        f_files = ex.submit(pmap, lambda e: raw_file(source, e["path"], 16 if e["path"].lower().endswith(MEDIA_EXT)
+                                                     else None), fetchable, 16)
         f_readme = ex.submit(raw_file, source, "README.md", 200_000)
         f_commits = ex.submit(gh, f"/repos/{source}/commits?path={urllib.parse.quote(sdir or smd)}&per_page=100")
         jobs = {"files": f_files.result(), "readme": f_readme.result(), "skill_commits": f_commits.result()}
@@ -894,7 +985,7 @@ def collect_github_fast(r, source, slug, owner_login, prefetched):
 
     author_commits = [c for c in skill_commits if c["email"] == main_email]
     extra_calls = []
-    if main_login and len([c for c in author_commits if not c["web"]]) < 10:
+    if main_login and len(author_commits) < 10:
         extra_calls.append(("author_commits", f"/repos/{source}/commits?author={main_login}&per_page=100"))
     if main_login and main_login.lower() != owner_login.lower():
         extra_calls.append(("skill_author", f"/users/{main_login}"))
@@ -936,6 +1027,16 @@ def collect_github_clone(r, source, slug, owner_login, max_commits):
         r["repo_skill_count"], r["skill_path"] = n_skills, smd
         all_commits = git_log(repo_dir, None, max_commits)
         skill_commits = git_log(repo_dir, sdir, max_commits) if sdir is not None else []
+        humans = collections.Counter(c["email"] for c in (skill_commits or all_commits) if not c["bot"])
+        if humans:
+            main_email = humans.most_common(1)[0][0]
+            mine = [c for c in all_commits if c["email"] == main_email]
+            if sum(1 for c in mine if c["tz_known"]) < 10:  # mostly web squash merges: read the PRs
+                enrich_offsets(source, mine)
+                fixed = {c["sha"]: c for c in mine if c["tz_known"]}
+                for c in skill_commits:
+                    if c["sha"] in fixed:
+                        c["date"], c["tz_known"] = fixed[c["sha"]]["date"], True
         r["git"] = summarize_git(all_commits, skill_commits, mode="clone")
         total = (git(repo_dir, "rev-list", "--count", "HEAD") or "").strip()
         roots = (git(repo_dir, "log", "--max-parents=0", "--format=%aI", "HEAD") or "").split()
@@ -1040,13 +1141,18 @@ def build(query, skill=None, do_clone=False, max_commits=2000):
                                     (owner, repo, contributors, gh(f"/repos/{source}/git/trees/HEAD?recursive=1")))
         else:
             collect_github_fast(r, source, slug, owner_login, (owner, repo, contributors, tree))
+            if r.get("skill_path") is None and shutil.which("git"):
+                WARNINGS[:] = [w for w in WARNINGS if not w.startswith("SKILL.md for")]
+                WARNINGS.append("fast mode could not locate the skill's files; fell back to a full clone")
+                r["mode"] = "clone (auto-fallback)"
+                collect_github_clone(r, source, slug, owner_login, max_commits)
         if not auth:
             WARNINGS.append(
                 "no GitHub auth found ($GITHUB_TOKEN / $GH_TOKEN / `gh auth login`): anonymous API, "
                 f"{GH_AUTH['remaining'] if GH_AUTH['remaining'] is not None else '?'} of 60 req/h left")
 
-    r["install_cmd"] = (f"npx skills add https://github.com/{source} --skill {slug}" if is_github
-                        else f"npx skills add {source} --skill {slug}")
+    if is_github:
+        r["install_cmd"] = f"npx skills add https://github.com/{source} --skill {slug}"
     r["untrusted_notice"] = UNTRUSTED_NOTICE
     r["github_api"] = {"calls": GH_AUTH["calls"], "remaining": GH_AUTH["remaining"], "limit": GH_AUTH["limit"]}
     r["origin_signals"] = origin_signals(r)
@@ -1158,8 +1264,18 @@ def md(r):
     for k, v in rows:
         if v not in (None, "", "None / None"):
             L.append(f"| {k} | {v} |")
-    if pg.get("summary"):
-        L.append(f"\n**Summary (skills.sh):** {q(pg['summary'], 1200)}")
+    fm = (r.get("scan") or {}).get("frontmatter") or {}
+    heads = (r.get("scan") or {}).get("skill_md_headings") or []
+    if fm.get("description") or pg.get("summary") or heads:
+        L.append("\n## About (what the skill says it does)")
+        if fm.get("description"):
+            L.append(f"- SKILL.md description: {q(fm['description'], 600)}")
+        if pg.get("summary"):
+            L.append(f"- skills.sh summary: {q(pg['summary'])}")
+            for pt in pg.get("summary_points") or []:
+                L.append(f"  - {q(pt, 250)}")
+        if heads:
+            L.append("- SKILL.md sections: " + ", ".join(q(h, 80) for h in heads))
 
     L.append("\n## Publisher")
     for k in ("login", "type", "name", "is_verified", "company", "location", "blog", "twitter_username",
@@ -1186,7 +1302,8 @@ def md(r):
     sc = r.get("scan")
     if sc:
         L.append(f"\n## Static scan ({sc['files']} files, {sc['total_bytes']} bytes)")
-        fm = sc.get("frontmatter") or {}
+        if sc.get("media_assets"):
+            L.append(f"- media assets (images/audio/fonts, header-checked only): {sc['media_assets']}")
         if fm.get("allowed-tools"):
             L.append(f"- allowed-tools: {q(fm['allowed-tools'])}")
         if not sc["findings"]:
@@ -1194,6 +1311,8 @@ def md(r):
         for f in sc["findings"][:25]:
             link = f"https://github.com/{r['source']}/blob/HEAD/{urllib.parse.quote(f['file'])}" + (f"#L{f['line']}" if f["line"] else "")
             L.append(f"- [{f['severity']}] {f['rule']} — [{f['file']}:{f['line']}]({link}) {q(f['snippet']) if f['snippet'] else ''}")
+            for c in f.get("context") or []:
+                L.append(f"    - L{c['line']}: {q(c['text'], 160)}")
         if sc["external_domains"]:
             L.append(f"- external domains referenced: {', '.join(sc['external_domains'][:15])}")
 
@@ -1208,13 +1327,16 @@ def md(r):
         if g.get("skill_author_logins"):
             L.append(f"- GitHub logins on skill commits: {g['skill_author_logins']}")
         tz = g.get("timezone") or {}
+        if tz.get("unknown_reason"):
+            L.append(f"- commit timezone: unknown ({tz['unknown_reason']})")
         if tz.get("offsets"):
             L.append(f"- main author {q(g.get('main_author'), 80)} — commit TZ offsets: "
                      + ", ".join(f"{o['offset']}×{o['count']}" for o in tz["offsets"])
                      + (f"; winter {tz.get('winter_offset')} / summer {tz.get('summer_offset')}" if tz.get("winter_offset") else "")
                      + (f"; peak local hours {tz.get('peak_local_hours')}" if tz.get("peak_local_hours") else "")
                      + (f"; weekend share {tz.get('weekend_share')}" if "weekend_share" in tz else "")
-                     + (f" (offsets recovered from {g['tz_sampled_from_patches']} sampled commits)" if g.get("tz_sampled_from_patches") is not None else ""))
+                     + (f" (offsets recovered from {g['tz_sampled_from_patches']} sampled commits)" if g.get("tz_sampled_from_patches") is not None else "")
+                     + (f"; {tz['from_pr_patches']} of them via the original PR commits" if tz.get("from_pr_patches") else ""))
 
     L.append("\n## Origin signals (author country is an inference, not a fact)")
     if r["origin_signals"]:
