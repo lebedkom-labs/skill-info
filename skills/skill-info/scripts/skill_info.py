@@ -2,7 +2,7 @@
 """skill-info: trust & provenance report for a skill listed on skills.sh.
 
 Usage:
-    skill_info.py <query> [--json] [--no-clone] [--max-commits N]
+    skill_info.py <query> [--json] [--clone] [--max-commits N]
 
 <query> may be:
     find-skills                              bare skill name (resolved via skills.sh search)
@@ -11,15 +11,26 @@ Usage:
     https://skills.sh/vercel-labs/skills/find-skills
     https://github.com/vercel-labs/skills    (whole repo; picks the matching skill if --skill given)
 
-Stdlib only. Network: skills.sh, api.github.com, github.com (blobless clone).
-Set GITHUB_TOKEN / GH_TOKEN to raise the GitHub API limit from 60 to 5000 req/h.
+Stdlib only. Network: skills.sh, api.github.com, raw.githubusercontent.com, github.com.
+
+Default ("fast") mode never clones: GitHub metadata comes from ~5-8 REST calls, skill files from
+raw.githubusercontent.com, and real commit timezone offsets from the headers of `<sha>.patch`
+(range requests, ~1 KB each; the REST API only returns UTC). --clone does a blobless bare clone
+for full-history analysis (slow on big repos).
+
+GitHub auth is picked up from GITHUB_TOKEN / GH_TOKEN or `gh auth token`; without it the
+anonymous API limit is 60 req/h (about 8 lookups).
 """
 from __future__ import annotations
 
 import argparse
 import collections
+import concurrent.futures as cf
 import datetime as dt
+import email.utils
+import gzip
 import html
+import time
 import json
 import math
 import os
@@ -33,55 +44,130 @@ import urllib.parse
 import urllib.request
 
 UA = "skill-info/1.0 (+https://skills.sh)"
-SKILLS = "https://skills.sh"
+SKILLS = "https://www.skills.sh"  # apex redirects (308) to www
 GH_API = "https://api.github.com"
 TIMEOUT = 20
 
 # --------------------------------------------------------------------------- http
 
 
-def http_get(url: str, headers: dict | None = None, timeout: int = TIMEOUT):
-    """Return (status, body_text). Never raises on HTTP errors."""
-    req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
+def http_get(url: str, headers: dict | None = None, timeout: int = TIMEOUT, raw: bool = False):
+    """Return (status, body, headers). body is str (or bytes if raw). Never raises."""
+    # a byte Range of a gzip stream can't be decompressed, so ranged requests ask for identity
+    enc = "identity" if headers and "Range" in headers else "gzip"
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": enc, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.read().decode("utf-8", "replace")
+            data = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                data = gzip.decompress(data)
+            return r.status, (data if raw else data.decode("utf-8", "replace")), dict(r.headers)
     except urllib.error.HTTPError as e:
         try:
-            body = e.read().decode("utf-8", "replace")
+            data = e.read()
         except Exception:
-            body = ""
-        return e.code, body
+            data = b""
+        return e.code, (data if raw else data.decode("utf-8", "replace")), dict(e.headers or {})
     except Exception as e:  # network / timeout
-        return 0, str(e)
+        return 0, (b"" if raw else str(e)), {}
 
 
 def get_json(url: str, headers: dict | None = None):
-    status, body = http_get(url, headers)
+    status, body, hdrs = http_get(url, headers)
     if status != 200:
-        return None, status, body[:300]
+        return None, status, body[:300], hdrs
     try:
-        return json.loads(body), status, None
+        return json.loads(body), status, None, hdrs
     except ValueError:
-        return None, status, "invalid json"
+        return None, status, "invalid json", hdrs
+
+
+WARNINGS: list[str] = []
+GH_AUTH = {"token": None, "via": None, "remaining": None, "limit": None, "calls": 0}
+
+
+def detect_github_auth():
+    """Token from env, else from an authenticated GitHub CLI. Returns source label or None."""
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        if os.environ.get(var):
+            GH_AUTH.update(token=os.environ[var], via=f"${var}")
+            return GH_AUTH["via"]
+    if shutil.which("gh"):
+        try:
+            r = subprocess.run(["gh", "auth", "token"], capture_output=True, timeout=5)
+            tok = r.stdout.decode().strip()
+            if r.returncode == 0 and tok:
+                GH_AUTH.update(token=tok, via="gh CLI")
+                return GH_AUTH["via"]
+        except Exception:
+            pass
+    return None
 
 
 def gh_headers():
-    tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     h = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-    if tok:
-        h["Authorization"] = f"Bearer {tok}"
+    if GH_AUTH["token"]:
+        h["Authorization"] = f"Bearer {GH_AUTH['token']}"
     return h
 
 
 def gh(path: str):
-    data, status, err = get_json(GH_API + path, gh_headers())
-    if status == 403 and err and "rate limit" in err.lower():
-        WARNINGS.append("GitHub API rate limit hit (set GITHUB_TOKEN for 5000 req/h)")
+    data, status, err, hdrs = get_json(GH_API + path, gh_headers())
+    GH_AUTH["calls"] += 1
+    rem = hdrs.get("X-RateLimit-Remaining") or hdrs.get("x-ratelimit-remaining")
+    if rem is not None and rem.isdigit():
+        r = int(rem)
+        GH_AUTH["remaining"] = r if GH_AUTH["remaining"] is None else min(GH_AUTH["remaining"], r)
+        GH_AUTH["limit"] = hdrs.get("X-RateLimit-Limit") or hdrs.get("x-ratelimit-limit")
+    if status in (403, 429) and err and "rate limit" in err.lower():
+        msg = "GitHub API rate limit exhausted: publisher/repo/commit data is incomplete"
+        if not GH_AUTH["token"]:
+            msg += " (set GITHUB_TOKEN or run `gh auth login` for 5000 req/h)"
+        if msg not in WARNINGS:
+            WARNINGS.append(msg)
     return data
 
 
-WARNINGS: list[str] = []
+def pmap_deadline(fn, items, workers=8, deadline=3.0):
+    """Like pmap, but returns after `deadline` seconds; unfinished items yield None.
+    Daemon threads, so a hung request never delays process exit."""
+    import queue
+    import threading
+    items = list(items)
+    results, q, done = [None] * len(items), queue.Queue(), queue.Queue()
+    for i, it in enumerate(items):
+        q.put((i, it))
+
+    def worker():
+        while True:
+            try:
+                i, it = q.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                results[i] = fn(it)
+            except Exception:
+                pass
+            done.put(i)
+
+    for _ in range(min(workers, len(items))):
+        threading.Thread(target=worker, daemon=True).start()
+    end, finished = time.time() + deadline, 0
+    while finished < len(items):
+        try:
+            done.get(timeout=max(0.0, end - time.time()))
+            finished += 1
+        except Exception:
+            break
+    return list(results)
+
+
+def pmap(fn, items, workers=12):
+    items = list(items)
+    if not items:
+        return []
+    with cf.ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
+        return list(ex.map(fn, items))
 
 # --------------------------------------------------------------------------- resolve
 
@@ -108,11 +194,17 @@ def parse_query(q: str):
 
 def search(name: str):
     url = f"{SKILLS}/api/search?q={urllib.parse.quote(name)}&limit=100"
-    data, status, err = get_json(url)
+    data, status, err, _ = get_json(url)
     if not data:
         WARNINGS.append(f"skills.sh search failed ({status}): {err}")
         return []
     return data.get("skills", [])
+
+
+def choose(source, slug, hits):
+    same = [h for h in hits if h.get("skillId", "").lower() == slug.lower() or h.get("name", "").lower() == slug.lower()]
+    chosen = next((h for h in same if h["source"].lower() == source.lower()), None)
+    return chosen or {"id": f"{source}/{slug}", "source": source, "skillId": slug, "name": slug, "installs": None}, same
 
 
 def resolve(query: str, prefer_skill: str | None = None):
@@ -141,7 +233,7 @@ def resolve(query: str, prefer_skill: str | None = None):
 
 
 def page_text(url: str):
-    status, body = http_get(url)
+    status, body, _ = http_get(url)
     if status != 200:
         return None
     t = re.sub(r"<script.*?</script>|<style.*?</style>", "", body, flags=re.S)
@@ -190,7 +282,7 @@ def scrape_skill_page(skill_id: str, slug: str):
 
 
 def fetch_audits(skill_id: str):
-    data, status, err = get_json(f"{SKILLS}/api/v1/skills/audit/{skill_id}")
+    data, status, err, _ = get_json(f"{SKILLS}/api/v1/skills/audit/{skill_id}")
     if not data:
         return None
     return data.get("audits", [])
@@ -200,12 +292,29 @@ _NAV = {"about", "agent", "agents", "audits", "contact", "docs", "hot", "officia
         "privacy", "terms", "topic", "topics", "trending", "api"}
 
 
-def official_owners():
-    status, body = http_get(f"{SKILLS}/official")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "skill-info")
+
+
+def official_owners(ttl=86_400):
+    """Official publishers from skills.sh/official (~80 KB gzipped), cached for a day."""
+    path = os.path.join(CACHE_DIR, "official.json")
+    try:
+        if time.time() - os.path.getmtime(path) < ttl:
+            with open(path) as f:
+                return set(json.load(f))
+    except (OSError, ValueError):
+        pass
+    status, body, _ = http_get(f"{SKILLS}/official")
     if status != 200:
         return set()
-    owners = set(re.findall(r'href="/([A-Za-z0-9_.-]+)"', body))
-    return {o.lower() for o in owners} - _NAV
+    owners = {o.lower() for o in re.findall(r'href="/([A-Za-z0-9_.-]+)"', body)} - _NAV
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(sorted(owners), f)
+    except OSError:
+        pass
+    return owners
 
 
 # --------------------------------------------------------------------------- git (blobless clone)
@@ -279,6 +388,7 @@ def git_log(repo, path=None, max_commits=2000):
             "committer_email": ce.lower(), "subject": subj, "body": body,
             "bot": bool(BOT_RE.search(an) or BOT_RE.search(ae)),
             "web": ce.lower() == "noreply@github.com",
+            "tz_known": True,
         })
     return commits
 
@@ -391,7 +501,7 @@ def fmt_off(m: int):
 
 
 def tz_analysis(commits):
-    usable = [c for c in commits if not c["bot"] and not c["web"]]
+    usable = [c for c in commits if not c["bot"] and not c["web"] and c.get("tz_known")]
     offs = collections.Counter(int(c["date"].utcoffset().total_seconds() // 60) for c in usable)
     winter = collections.Counter(int(c["date"].utcoffset().total_seconds() // 60)
                                  for c in usable if c["date"].month in (11, 12, 1, 2, 3))
@@ -476,26 +586,39 @@ BINARY_EXT = (".exe", ".dll", ".so", ".dylib", ".bin", ".jar", ".pyc", ".wasm", 
 URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+)")
 
 
-def static_scan(repo, skill_dir, skill_md_path=None):
+def clone_skill_files(repo, skill_dir):
+    """[(path, size, bytes|None)] for the skill folder of a local bare clone."""
     listing = git(repo, "ls-tree", "-r", "-l", "HEAD", "--", skill_dir or ".") or ""
-    files = []
+    out = []
     for line in listing.splitlines():
         m = re.match(r"\d+ (\w+) [0-9a-f]+\s+(-|\d+)\t(.+)$", line)
-        if m and m.group(1) == "blob":
-            files.append((m.group(3), int(m.group(2)) if m.group(2) != "-" else 0))
+        if not (m and m.group(1) == "blob"):
+            continue
+        path, size = m.group(3), int(m.group(2)) if m.group(2) != "-" else 0
+        data = None
+        if len(out) < MAX_SCAN_FILES and size <= MAX_SCAN_BYTES and not path.lower().endswith(BINARY_EXT):
+            data = subprocess.run(["git", "--git-dir", repo, "cat-file", "-p", f"HEAD:{path}"],
+                                  capture_output=True, timeout=60).stdout
+        out.append((path, size, data))
+    return out
+
+
+MAX_SCAN_FILES, MAX_SCAN_BYTES = 120, 512_000
+
+
+def scan_files(files, skill_md_path=None):
+    """Static scan of [(path, size, bytes|None)]; None content = not fetched (binary/too big/limit)."""
     findings, domains, total = [], collections.Counter(), 0
     skill_md_text, frontmatter = None, {}
     exts = collections.Counter()
-    for path, size in files[:120]:
+    for path, size, raw in files:
         total += size
         exts[os.path.splitext(path)[1].lower() or "(none)"] += 1
         if path.lower().endswith(BINARY_EXT):
             findings.append({"rule": "binary-file", "severity": "medium", "file": path, "line": 0, "snippet": ""})
             continue
-        if size > 512_000:
+        if raw is None:
             continue
-        raw = subprocess.run(["git", "--git-dir", repo, "cat-file", "-p", f"HEAD:{path}"],
-                             capture_output=True, timeout=60).stdout
         if b"\x00" in raw[:8000]:
             findings.append({"rule": "binary-file", "severity": "medium", "file": path, "line": 0, "snippet": ""})
             continue
@@ -635,99 +758,277 @@ def years_since(iso):
     return round((dt.datetime.now(dt.timezone.utc) - t).days / 365.25, 2)
 
 
+# --------------------------------------------------------------------------- fast GitHub collector (no clone)
+
+RAW = "https://raw.githubusercontent.com"
+PATCH_SAMPLE = 30     # commits whose .patch header is fetched to recover the local UTC offset
+PATCH_DEADLINE = 3.0  # seconds; whatever arrived by then is used
+
+
+def raw_file(source, path, max_bytes=None):
+    hdr = {"Range": f"bytes=0-{max_bytes - 1}"} if max_bytes else None
+    status, body, _ = http_get(f"{RAW}/{source}/HEAD/{urllib.parse.quote(path)}", hdr, raw=True)
+    return body if status in (200, 206) else None
+
+
+def frontmatter_name(text: str):
+    m = re.search(r"^name:\s*['\"]?([^'\"\n]+)", text or "", re.M)
+    return m.group(1).strip() if m else None
+
+
+def api_skill_dir(source, slug, tree):
+    """Locate the skill folder using the git tree from the API. Returns (dir, SKILL.md path, n_skills)."""
+    entries = (tree or {}).get("tree") or []
+    skill_mds = [e["path"] for e in entries if e.get("type") == "blob" and e["path"].endswith("SKILL.md")]
+    parent = lambda f: f.rsplit("/", 1)[0] if "/" in f else ""
+    for f in skill_mds:
+        if parent(f).rsplit("/", 1)[-1].lower() == slug.lower():
+            return parent(f), f, len(skill_mds)
+    if len(skill_mds) == 1:
+        return parent(skill_mds[0]), skill_mds[0], 1
+    cands = skill_mds[:60]
+    if not cands:  # truncated / missing tree: probe the usual layouts
+        cands = [f"skills/{slug}/SKILL.md", f"{slug}/SKILL.md", f".claude/skills/{slug}/SKILL.md",
+                 f"plugins/{slug}/skills/{slug}/SKILL.md", "SKILL.md"]
+    heads = pmap(lambda f: raw_file(source, f, 2048), cands, 16)
+    for f, body in zip(cands, heads):
+        if body and (frontmatter_name(body.decode("utf-8", "replace")) or "").lower() == slug.lower():
+            return parent(f), f, len(skill_mds) or None
+    return None, None, len(skill_mds) or None
+
+
+def api_commit(c):
+    cm = c.get("commit") or {}
+    a, cmt = cm.get("author") or {}, cm.get("committer") or {}
+    login = (c.get("author") or {}).get("login")
+    name, mail = a.get("name") or "", (a.get("email") or "").lower()
+    try:
+        when = dt.datetime.fromisoformat((a.get("date") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    msg = cm.get("message") or ""
+    subj, _, body = msg.partition("\n")
+    return {"sha": c.get("sha"), "author": name, "email": mail, "login": login, "date": when,
+            "committer_email": (cmt.get("email") or "").lower(), "subject": subj, "body": body.strip(),
+            "bot": bool(BOT_RE.search(name) or BOT_RE.search(mail) or BOT_RE.search(login or "")),
+            "web": (cmt.get("email") or "").lower() == "noreply@github.com", "tz_known": False}
+
+
+def patch_date(source, sha):
+    """Local author date (with UTC offset) from the mbox header of <sha>.patch (first 1.5 KB only)."""
+    for attempt in range(2):  # 429/503: burst throttling, or a huge diff GitHub won't render in time
+        status, body, _ = http_get(f"https://github.com/{source}/commit/{sha}.patch",
+                                   {"Range": "bytes=0-1535"}, timeout=5)
+        if status not in (429, 503):
+            break
+        time.sleep(0.3)
+    if status not in (200, 206):
+        return None
+    m = re.search(r"^Date: (.+)$", body, re.M)
+    try:
+        return email.utils.parsedate_to_datetime(m.group(1).strip()) if m else None
+    except (TypeError, ValueError):
+        return None
+
+
+def enrich_offsets(source, commits):
+    todo = [c for c in commits if not c["tz_known"] and not c["bot"] and not c["web"]][:PATCH_SAMPLE]
+    dates = pmap_deadline(lambda c: patch_date(source, c["sha"]), todo, 8, PATCH_DEADLINE)
+    ok = 0
+    for c, d in zip(todo, dates):
+        if d is not None and d.utcoffset() is not None:
+            c["date"], c["tz_known"] = d, True
+            ok += 1
+    return ok
+
+
+def collect_github_fast(r, source, slug, owner_login, prefetched):
+    owner, repo, contributors, tree = prefetched
+    if (tree or {}).get("truncated"):
+        WARNINGS.append("repo tree is truncated by the GitHub API (huge repo): skill lookup fell back to path probing")
+    sdir, smd, n_skills = api_skill_dir(source, slug, tree)
+    r["repo_skill_count"], r["skill_path"] = n_skills, smd
+    if smd is None:
+        WARNINGS.append(f"SKILL.md for '{slug}' not found in repo HEAD")
+        return
+
+    entries = [e for e in (tree or {}).get("tree") or []
+               if e.get("type") == "blob" and (not sdir or e["path"].startswith(sdir + "/"))]
+    if not entries:
+        entries = [{"path": smd, "size": 0}]
+    fetchable = [e for e in entries[:MAX_SCAN_FILES]
+                 if (e.get("size") or 0) <= MAX_SCAN_BYTES and not e["path"].lower().endswith(BINARY_EXT)]
+    jobs = {"files": None, "readme": None, "skill_commits": None}
+    with cf.ThreadPoolExecutor(max_workers=3) as ex:
+        f_files = ex.submit(pmap, lambda e: raw_file(source, e["path"]), fetchable, 16)
+        f_readme = ex.submit(raw_file, source, "README.md", 200_000)
+        f_commits = ex.submit(gh, f"/repos/{source}/commits?path={urllib.parse.quote(sdir or smd)}&per_page=100")
+        jobs = {"files": f_files.result(), "readme": f_readme.result(), "skill_commits": f_commits.result()}
+    got = {e["path"]: b for e, b in zip(fetchable, jobs["files"])}
+    files = [(e["path"], e.get("size") or len(got.get(e["path"]) or b""), got.get(e["path"])) for e in entries]
+    r["scan"] = scan_files(files, smd)
+    if len(entries) > MAX_SCAN_FILES:
+        WARNINGS.append(f"skill has {len(entries)} files; scanned the first {MAX_SCAN_FILES}")
+
+    skill_commits = [c for c in map(api_commit, jobs["skill_commits"] or []) if c]
+    humans = collections.Counter(c["email"] for c in skill_commits if not c["bot"])
+    main_email = humans.most_common(1)[0][0] if humans else None
+    main_login = next((c["login"] for c in skill_commits if c["email"] == main_email and c["login"]), None)
+
+    author_commits = [c for c in skill_commits if c["email"] == main_email]
+    extra_calls = []
+    if main_login and len([c for c in author_commits if not c["web"]]) < 10:
+        extra_calls.append(("author_commits", f"/repos/{source}/commits?author={main_login}&per_page=100"))
+    if main_login and main_login.lower() != owner_login.lower():
+        extra_calls.append(("skill_author", f"/users/{main_login}"))
+    extra = dict(zip([k for k, _ in extra_calls], pmap(lambda kv: gh(kv[1]), extra_calls, 2)))
+    if extra.get("author_commits"):
+        seen = {c["sha"] for c in author_commits}
+        author_commits += [c for c in map(api_commit, extra["author_commits"]) if c and c["sha"] not in seen]
+    if extra.get("skill_author"):
+        r["github"]["skill_author"] = pick(extra["skill_author"], "login", "name", "company", "blog", "location",
+                                           "bio", "twitter_username", "followers", "created_at")
+
+    sampled = enrich_offsets(source, author_commits)
+    by_sha = {c["sha"]: c for c in author_commits}
+    for c in skill_commits:  # share recovered offsets with the skill commit list
+        if c["sha"] in by_sha and by_sha[c["sha"]]["tz_known"]:
+            c["date"], c["tz_known"] = by_sha[c["sha"]]["date"], True
+
+    r["git"] = summarize_git(author_commits, skill_commits, mode="fast")
+    r["git"]["tz_sampled_from_patches"] = sampled
+    logins = collections.Counter(c["login"] for c in skill_commits if c["login"])
+    r["git"]["skill_author_logins"] = dict(logins.most_common(5))
+    if len(skill_commits) >= 100:
+        r["git"]["skill_commits_note"] = "100+ (API page limit)"
+
+    text = "\n".join(c["subject"] + "\n" + c["body"] for c in skill_commits)
+    r["language"] = {"commit_messages": script_profile(text),
+                     "skill_md": script_profile(r["scan"].get("skill_md_text") or "")}
+    if jobs["readme"]:
+        r["language"]["readme"] = script_profile(jobs["readme"].decode("utf-8", "replace"))
+
+
+def collect_github_clone(r, source, slug, owner_login, max_commits):
+    tmp = tempfile.mkdtemp(prefix="skill-info-")
+    try:
+        repo_dir = os.path.join(tmp, "repo.git")
+        if not clone(source, repo_dir):
+            return False
+        sdir, smd, n_skills = find_skill_dir(repo_dir, slug)
+        r["repo_skill_count"], r["skill_path"] = n_skills, smd
+        all_commits = git_log(repo_dir, None, max_commits)
+        skill_commits = git_log(repo_dir, sdir, max_commits) if sdir is not None else []
+        r["git"] = summarize_git(all_commits, skill_commits, mode="clone")
+        total = (git(repo_dir, "rev-list", "--count", "HEAD") or "").strip()
+        roots = (git(repo_dir, "log", "--max-parents=0", "--format=%aI", "HEAD") or "").split()
+        if total.isdigit():
+            r["git"]["repo_commits"] = int(total)
+        if roots:
+            r["git"]["repo_first_commit"] = min(roots)
+        if not smd:
+            WARNINGS.append(f"SKILL.md for '{slug}' not found in repo HEAD")
+            return True
+        api = gh(f"/repos/{source}/commits?path={urllib.parse.quote(sdir or smd)}&per_page=100") or []
+        logins = collections.Counter((c.get("author") or {}).get("login") for c in api if isinstance(c, dict))
+        logins.pop(None, None)
+        r["git"]["skill_author_logins"] = dict(logins.most_common(5))
+        top = logins.most_common(1)[0][0] if logins else None
+        if top and top.lower() != owner_login.lower():
+            r["github"]["skill_author"] = pick(gh(f"/users/{top}") or {}, "login", "name", "company", "blog",
+                                               "location", "bio", "twitter_username", "followers", "created_at")
+        r["scan"] = scan_files(clone_skill_files(repo_dir, sdir), smd)
+        text = "\n".join(c["subject"] + "\n" + c["body"] for c in skill_commits or all_commits)
+        r["language"] = {"commit_messages": script_profile(text),
+                         "skill_md": script_profile(r["scan"].get("skill_md_text") or "")}
+        readme = git(repo_dir, "cat-file", "-p", "HEAD:README.md")
+        if readme:
+            r["language"]["readme"] = script_profile(readme)
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------- main pipeline
 
 
-def build(query, skill=None, do_clone=True, max_commits=2000):
-    chosen, same = resolve(query, skill)
+def build(query, skill=None, do_clone=False, max_commits=2000):
+    auth = detect_github_auth()
+    q_source, q_slug = parse_query(query)
+    q_slug = skill or q_slug
+    if q_source and q_slug:  # id known up front: search runs in parallel with the rest
+        chosen, same, f_search = {"id": f"{q_source}/{q_slug}", "source": q_source, "skillId": q_slug}, [], True
+    else:
+        chosen, same = resolve(query, skill)
+        f_search = None
     skill_id, source = chosen["id"], chosen["source"]
     slug = chosen.get("skillId") or chosen.get("name")
-    r = {"query": query, "id": skill_id, "source": source, "slug": slug,
-         "url": f"{SKILLS}/{skill_id}", "installs": chosen.get("installs")}
-
-    off = official_owners()
     owner_login = source.split("/")[0] if "/" in source else source
-    r["official"] = owner_login.lower() in off
-
-    r["name_collisions"] = []
-    for h in same:
-        if h["id"] == skill_id:
-            continue
-        mine, theirs = r["installs"] or 0, h.get("installs") or 0
-        r["name_collisions"].append({
-            "id": h["id"], "installs": theirs,
-            "typosquat_risk": theirs >= 10 * max(mine, 1) and not r["official"],
-        })
-
-    r["page"] = scrape_skill_page(skill_id, slug)
-    r["audits"] = fetch_audits(skill_id)
-
     is_github = "/" in source and "." not in source.split("/")[0]
+    r = {"query": query, "id": skill_id, "source": source, "slug": slug,
+         "url": f"{SKILLS}/{skill_id}", "installs": chosen.get("installs"),
+         "mode": "clone" if do_clone else "fast", "github_auth": auth}
+
+    # everything that only needs the id runs in parallel
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        if f_search:
+            f_search = ex.submit(search, slug)
+        f_off = ex.submit(official_owners)
+        f_page = ex.submit(scrape_skill_page, skill_id, slug)
+        f_aud = ex.submit(fetch_audits, skill_id)
+        if is_github:
+            f_owner = ex.submit(gh, f"/users/{owner_login}")
+            f_repo = ex.submit(gh, f"/repos/{source}")
+            f_contrib = ex.submit(gh, f"/repos/{source}/contributors?per_page=10")
+            f_tree = None if do_clone else ex.submit(gh, f"/repos/{source}/git/trees/HEAD?recursive=1")
+        if f_search:
+            chosen, same = choose(source, slug, f_search.result())
+            r["installs"] = chosen.get("installs")
+        r["official"] = owner_login.lower() in f_off.result()
+        r["page"] = f_page.result()
+        r["audits"] = f_aud.result()
+        if is_github:
+            owner, repo = f_owner.result() or {}, f_repo.result() or {}
+            contributors = f_contrib.result() or []
+            tree = f_tree.result() if f_tree else None
+
+    r["name_collisions"] = sorted(
+        ({"id": h["id"], "installs": h.get("installs") or 0,
+          "typosquat_risk": (h.get("installs") or 0) >= 10 * max(r["installs"] or 0, 1) and not r["official"]}
+         for h in same if h["id"] != skill_id),
+        key=lambda c: c["installs"], reverse=True)
+
     r["github"] = {}
-    if is_github:
-        owner = gh(f"/users/{owner_login}") or {}
+    if not is_github:
+        WARNINGS.append("non-GitHub (well-known/registry) source: no repo, owner or commit provenance available")
+    else:
         if owner.get("type") == "Organization":
             owner = {**owner, **(gh(f"/orgs/{owner_login}") or {})}
         r["github"]["owner"] = pick(owner, "login", "type", "name", "company", "blog", "location", "email",
                                     "bio", "twitter_username", "followers", "public_repos", "created_at",
                                     "is_verified", "description", "hireable")
-        repo = gh(f"/repos/{source}") or {}
         r["github"]["repo"] = pick(repo, "full_name", "description", "stargazers_count", "forks_count",
                                    "open_issues_count", "subscribers_count", "created_at", "pushed_at",
                                    "archived", "fork", "license", "topics", "language", "default_branch", "homepage")
-        r["github"]["contributors"] = [
-            {"login": c.get("login"), "contributions": c.get("contributions")}
-            for c in (gh(f"/repos/{source}/contributors?per_page=10") or [])
-            if isinstance(c, dict)
-        ]
+        r["github"]["contributors"] = [{"login": c.get("login"), "contributions": c.get("contributions")}
+                                       for c in contributors if isinstance(c, dict)]
+        if do_clone and not shutil.which("git"):
+            WARNINGS.append("--clone requested but git is not installed; using fast mode")
+            do_clone, r["mode"] = False, "fast"
+            tree = gh(f"/repos/{source}/git/trees/HEAD?recursive=1")
+        if do_clone:
+            if not collect_github_clone(r, source, slug, owner_login, max_commits):
+                r["mode"] = "fast (clone failed)"
+                collect_github_fast(r, source, slug, owner_login,
+                                    (owner, repo, contributors, gh(f"/repos/{source}/git/trees/HEAD?recursive=1")))
+        else:
+            collect_github_fast(r, source, slug, owner_login, (owner, repo, contributors, tree))
+        if not auth:
+            WARNINGS.append(
+                "no GitHub auth found ($GITHUB_TOKEN / $GH_TOKEN / `gh auth login`): anonymous API, "
+                f"{GH_AUTH['remaining'] if GH_AUTH['remaining'] is not None else '?'} of 60 req/h left")
 
-    if not is_github:
-        WARNINGS.append("non-GitHub (well-known/registry) source: no repo, owner or commit provenance available")
-    r["name_collisions"].sort(key=lambda c: c["installs"] or 0, reverse=True)
-
-    if is_github and do_clone and shutil.which("git"):
-        tmp = tempfile.mkdtemp(prefix="skill-info-")
-        try:
-            repo_dir = os.path.join(tmp, "repo.git")
-            if clone(source, repo_dir):
-                sdir, smd, n_skills = find_skill_dir(repo_dir, slug)
-                r["repo_skill_count"] = n_skills
-                r["skill_path"] = smd
-                all_commits = git_log(repo_dir, None, max_commits)
-                skill_commits = git_log(repo_dir, sdir, max_commits) if sdir is not None else []
-                r["git"] = summarize_git(all_commits, skill_commits)
-                total = (git(repo_dir, "rev-list", "--count", "HEAD") or "").strip()
-                roots = (git(repo_dir, "log", "--max-parents=0", "--format=%aI", "HEAD") or "").split()
-                if total.isdigit():
-                    r["git"]["repo_commits"] = int(total)
-                if roots:
-                    r["git"]["repo_first_commit"] = min(roots)
-                # map skill authors to GitHub logins via API (1 call)
-                if smd:
-                    api = gh(f"/repos/{source}/commits?path={urllib.parse.quote(sdir or smd)}&per_page=100") or []
-                    logins = collections.Counter(
-                        (c.get("author") or {}).get("login") for c in api if isinstance(c, dict))
-                    logins.pop(None, None)
-                    r["git"]["skill_author_logins"] = dict(logins.most_common(5))
-                    top = logins.most_common(1)[0][0] if logins else None
-                    if top and top.lower() != owner_login.lower():
-                        u = gh(f"/users/{top}") or {}
-                        r["github"]["skill_author"] = pick(u, "login", "name", "company", "blog", "location",
-                                                           "bio", "twitter_username", "followers", "created_at")
-                    r["scan"] = static_scan(repo_dir, sdir, smd)
-                    text = "\n".join(c["subject"] + "\n" + c["body"] for c in skill_commits or all_commits)
-                    r["language"] = {
-                        "commit_messages": script_profile(text),
-                        "skill_md": script_profile(r["scan"].get("skill_md_text") or ""),
-                    }
-                    readme = git(repo_dir, "cat-file", "-p", "HEAD:README.md")
-                    if readme:
-                        r["language"]["readme"] = script_profile(readme)
-                else:
-                    WARNINGS.append(f"SKILL.md for '{slug}' not found in repo HEAD")
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-
+    r["github_api"] = {"calls": GH_AUTH["calls"], "remaining": GH_AUTH["remaining"], "limit": GH_AUTH["limit"]}
     r["origin_signals"] = origin_signals(r)
     r["trust"] = trust_score(r)
     r["warnings"] = WARNINGS
@@ -743,22 +1044,26 @@ def pick(d, *keys):
     return out
 
 
-def summarize_git(all_commits, skill_commits):
+def summarize_git(all_commits, skill_commits, mode="clone"):
+    """clone mode: all_commits = whole repo history. fast mode: all_commits = main author's commits."""
     def authors(cs):
         c = collections.Counter((x["author"], x["email"].rsplit("@", 1)[-1]) for x in cs if not x["bot"])
         return [{"name": a, "email_domain": d, "commits": n} for (a, d), n in c.most_common(6)]
 
+    def iso(c):
+        return c["date"].isoformat() if c else None
+
     out = {
-        "repo_commits": len(all_commits),
-        "repo_first_commit": all_commits[-1]["date"].isoformat() if all_commits else None,
-        "repo_last_commit": all_commits[0]["date"].isoformat() if all_commits else None,
-        "repo_authors": authors(all_commits),
         "skill_commits": len(skill_commits),
-        "skill_first_commit": skill_commits[-1]["date"].isoformat() if skill_commits else None,
-        "skill_last_commit": skill_commits[0]["date"].isoformat() if skill_commits else None,
+        "skill_first_commit": iso(skill_commits[-1]) if skill_commits else None,
+        "skill_last_commit": iso(skill_commits[0]) if skill_commits else None,
         "skill_authors": authors(skill_commits),
     }
-    # tz analysis on the main human author of the skill (fallback: whole repo)
+    if mode == "clone":
+        out.update(repo_commits=len(all_commits),
+                   repo_first_commit=iso(all_commits[-1]) if all_commits else None,
+                   repo_last_commit=iso(all_commits[0]) if all_commits else None,
+                   repo_authors=authors(all_commits))
     base = skill_commits or all_commits
     humans = collections.Counter(c["email"] for c in base if not c["bot"])
     main_email = humans.most_common(1)[0][0] if humans else None
@@ -872,9 +1177,10 @@ def md(r):
 
     g = r.get("git")
     if g:
-        L.append("\n## Git history")
-        L.append(f"- repo: {g['repo_commits']} commits, {(g['repo_first_commit'] or '')[:10]} → {(g['repo_last_commit'] or '')[:10]}")
-        L.append(f"- this skill: {g['skill_commits']} commits, {(g['skill_first_commit'] or '')[:10]} → {(g['skill_last_commit'] or '')[:10]}")
+        L.append("\n## Git history" + (" (fast mode: GitHub API + .patch headers, no clone)" if r.get("mode") != "clone" else " (full clone)"))
+        if "repo_commits" in g:
+            L.append(f"- repo: {g['repo_commits']} commits, {(g['repo_first_commit'] or '')[:10]} → {(g['repo_last_commit'] or '')[:10]}")
+        L.append(f"- this skill: {g.get('skill_commits_note') or g['skill_commits']} commits, {(g['skill_first_commit'] or '')[:10]} → {(g['skill_last_commit'] or '')[:10]}")
         if g.get("skill_authors"):
             L.append("- skill authors: " + ", ".join(f"{a['name']} @{a['email_domain']} ({a['commits']})" for a in g["skill_authors"]))
         if g.get("skill_author_logins"):
@@ -885,7 +1191,8 @@ def md(r):
                      + ", ".join(f"{o['offset']}×{o['count']}" for o in tz["offsets"])
                      + (f"; winter {tz.get('winter_offset')} / summer {tz.get('summer_offset')}" if tz.get("winter_offset") else "")
                      + (f"; peak local hours {tz.get('peak_local_hours')}" if tz.get("peak_local_hours") else "")
-                     + (f"; weekend share {tz.get('weekend_share')}" if "weekend_share" in tz else ""))
+                     + (f"; weekend share {tz.get('weekend_share')}" if "weekend_share" in tz else "")
+                     + (f" (offsets recovered from {g['tz_sampled_from_patches']} sampled commits)" if g.get("tz_sampled_from_patches") is not None else ""))
 
     L.append("\n## Origin signals (author country is an inference, not a fact)")
     if r["origin_signals"]:
@@ -903,6 +1210,10 @@ def md(r):
     L.append("| Component | Points | Detail |\n|---|---|---|")
     for b in t["breakdown"]:
         L.append(f"| {b['component']} | {b['points']}/{b['max']} | {b['detail']} |")
+    api = r.get("github_api") or {}
+    usage = (f"GitHub API calls: {api.get('calls')}, remaining: {api.get('remaining')}/{api.get('limit') or '?'}"
+             if api.get("calls") else "GitHub API not used")
+    L.append(f"\n_Mode: {r.get('mode')} · GitHub auth: {r.get('github_auth') or 'none (anonymous)'} · {usage}_")
     if r.get("warnings"):
         L.append("\n_Warnings: " + "; ".join(r["warnings"]) + "_")
     return "\n".join(L)
@@ -913,10 +1224,12 @@ def main():
     ap.add_argument("query", help="skill name, owner/repo/skill, owner/repo@skill, or skills.sh / GitHub URL")
     ap.add_argument("--skill", help="skill name when query is a repo URL")
     ap.add_argument("--json", action="store_true", help="emit raw JSON instead of markdown")
-    ap.add_argument("--no-clone", action="store_true", help="skip git clone (no commit/TZ/static analysis)")
-    ap.add_argument("--max-commits", type=int, default=2000)
+    ap.add_argument("--clone", action="store_true",
+                    help="deep mode: blobless clone for full-history analysis (slow on big repos)")
+    ap.add_argument("--no-clone", action="store_true", help=argparse.SUPPRESS)  # v1 compat; fast is default now
+    ap.add_argument("--max-commits", type=int, default=2000, help="history cap in --clone mode")
     a = ap.parse_args()
-    r = build(a.query, a.skill, not a.no_clone, a.max_commits)
+    r = build(a.query, a.skill, a.clone and not a.no_clone, a.max_commits)
     if a.json:
         print(json.dumps(r, ensure_ascii=False, indent=2, default=str))
     else:

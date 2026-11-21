@@ -26,14 +26,30 @@ In Claude Code:
 
 From any other agent, just ask: "check the skill `yandex-wordstat` before I install it".
 
-You can also run the script standalone (Python 3.9+, `git`, standard library only):
+You can also run the script standalone (Python 3.9+, standard library only; `git` only for `--clone`):
 
 ```bash
-python3 skills/skill-info/scripts/skill_info.py find-skills          # markdown
-python3 skills/skill-info/scripts/skill_info.py find-skills --json   # raw data
+python3 skills/skill-info/scripts/skill_info.py find-skills           # markdown, fast mode
+python3 skills/skill-info/scripts/skill_info.py find-skills --json    # raw data
+python3 skills/skill-info/scripts/skill_info.py find-skills --clone   # deep mode: full git history
 ```
 
-Set `GITHUB_TOKEN` to raise the GitHub API limit from 60 to 5000 requests/hour.
+### Modes
+
+| | fast (default) | `--clone` |
+|---|---|---|
+| Typical time | 5–8 s | 30 s to several minutes, depending on repo size |
+| Commit history | skill folder (up to 100 commits) + the main author's commits | the whole repo |
+| Commit timezone | read from the headers of up to 30 sampled `<sha>.patch` files | every commit |
+| Skill files for the static scan | raw.githubusercontent.com | git objects |
+
+Both modes reach the same conclusions about the author's timezone. For example, `yandex-wordstat` gives `+0300` with no DST shift either way. Fast mode took 4.6 s on it, `--clone` took 42.6 s.
+
+### GitHub auth
+
+The script picks up a token automatically, from `$GITHUB_TOKEN`, `$GH_TOKEN` or a logged-in `gh` CLI. Without one it falls back to the anonymous API: 60 requests/hour, which is enough for about 8 lookups, and the report shows a warning. The fast mode needs about 5–8 API calls per lookup. Patches and raw files are downloaded from github.com and raw.githubusercontent.com directly, so they don't count against the API limit.
+
+The list of official publishers is cached for a day in `~/.cache/skill-info/`.
 
 ## Data sources
 
@@ -43,10 +59,12 @@ Set `GITHUB_TOKEN` to raise the GitHub API limit from 60 to 5000 requests/hour.
 | `skills.sh/api/v1/skills/audit/{id}` | security audit results |
 | `skills.sh/{id}` page | GitHub stars, first-seen date, summary, install command |
 | `skills.sh/official` | list of official publishers |
-| GitHub REST API | repo, owner/org, contributors, mapping of commits to logins |
-| blobless `git clone --bare` | full commit history with local UTC offsets, plus the skill files for the static scan |
+| GitHub REST API | repo, owner/org, contributors, git tree, the skill's commits and their logins |
+| raw.githubusercontent.com | the skill's files for the static scan, README |
+| `github.com/<repo>/commit/<sha>.patch` (first 1.5 KB) | the author's real local UTC offset (the REST API only returns UTC) |
+| blobless `git clone --bare` (only with `--clone`) | full commit history |
 
-Nothing from the cloned repository is executed. The temporary clone is deleted after the run.
+Nothing downloaded is ever executed. The temporary clone is deleted after the run.
 
 ## Privacy
 

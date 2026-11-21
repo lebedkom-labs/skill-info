@@ -24,16 +24,21 @@ If no query was given, ask for one. If the script reports "No exact match", show
 Run the bundled script from this skill's directory (the folder that contains this SKILL.md):
 
 ```bash
-python3 scripts/skill_info.py "<query>"            # markdown report
+python3 scripts/skill_info.py "<query>"            # markdown report (fast mode, ~5-8 s)
 python3 scripts/skill_info.py "<query>" --json     # full raw data, when you need details
+python3 scripts/skill_info.py "<query>" --clone    # deep mode: full git history (slow on big repos)
 ```
 
-- It needs Python 3.9+ and `git`, and uses only the standard library.
-- It takes about 10–40 s. It makes a blobless bare clone into a temp dir, deletes the clone afterwards, and never executes anything from the cloned repo.
-- If `GITHUB_TOKEN` or `GH_TOKEN` is set, the script uses it. Without a token GitHub allows 60 requests/hour, which covers roughly 10 lookups.
-- `--no-clone` skips the git history, timezone analysis and static scan. Use it only for huge repos or when the clone times out.
+- It needs Python 3.9+ and uses only the standard library. `git` is needed only for `--clone`.
+- **Fast mode** is the default and never downloads the repo:
+  - publisher, repo and the skill's commits come from about 5–8 GitHub REST calls;
+  - the skill's files come from raw.githubusercontent.com;
+  - the authors' real local UTC offsets are read from the headers of up to 30 sampled `<sha>.patch` files (about 1.5 KB each).
+- **`--clone`** makes a blobless bare clone into a temp dir and deletes it afterwards. Nothing from the repo is executed. Use it only when the user asks for a deep or full-history check, or when fast mode could not find the skill's files. On big repos it can take minutes.
+- **GitHub auth** is detected automatically, from `GITHUB_TOKEN`, `GH_TOKEN`, or a logged-in `gh` CLI (`gh auth token`). With no auth the script still runs on the anonymous API (60 requests/hour, about 8 lookups) and adds a warning to the report. Pass that warning on to the user in one line, together with the fix: `gh auth login` or `export GITHUB_TOKEN=...`.
+- **GitHub MCP fallback:** if the report says the rate limit ran out and data is missing, check whether a GitHub MCP server is connected in this session. If one is, use its tools to fill in only the missing fields: owner profile, repo stats, the skill folder's commits. If none is connected, report with what you have and name the fields that are missing. Do not switch to `--clone` just to work around the rate limit.
 
-To compare several skills, run the script once per skill.
+To compare several skills, run the script once per skill. Keep the anonymous budget in mind.
 
 ## Step 2: Write the answer
 
